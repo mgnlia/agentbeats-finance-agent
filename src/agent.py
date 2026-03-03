@@ -1,129 +1,160 @@
+"""
+AgentBeats Finance Purple Agent — Core Reasoning Engine
+
+Chain-of-thought financial reasoning with structured tool use.
+Handles: stock valuation, risk assessment, portfolio optimization,
+market research, business process analysis.
+"""
+import os
 import json
+import math
+from typing import Any
+
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, TaskState, Part, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
 
-from messenger import Messenger
-from prompts import FINANCE_SYSTEM_PROMPT
-from financial_tools import TOOLS_SCHEMA, dispatch_tool
-from config import LLM_PROVIDER, OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_MODEL, GROQ_API_KEY, GROQ_MODEL
+from openai import AsyncOpenAI
+from tools import FINANCE_TOOLS, execute_tool
+
+# ---------------------------------------------------------------------------
+# System prompt — financial domain expert with CoT reasoning
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = """You are an expert financial analyst and portfolio manager with deep expertise in:
+- Equity valuation (DCF, comparable companies, precedent transactions)
+- Financial statement analysis (income statement, balance sheet, cash flow)
+- Risk assessment (VaR, Sharpe ratio, beta, correlation analysis)
+- Portfolio optimization (Modern Portfolio Theory, efficient frontier)
+- Macroeconomic analysis and sector research
+- Options pricing and derivatives
+- Fixed income analysis
+- M&A transaction analysis
+- Business process and operational finance
+
+## Reasoning Protocol
+Always use structured chain-of-thought reasoning:
+1. **Understand**: Parse the question — what financial concept is being tested?
+2. **Identify**: What data/formulas/frameworks are needed?
+3. **Calculate**: Show your work step-by-step with explicit formulas
+4. **Validate**: Sanity-check results against market norms
+5. **Conclude**: Provide a clear, actionable answer
+
+## Tool Use
+Use the available tools when you need:
+- `calculate`: Any mathematical computation (always use for numbers)
+- `search_market_data`: Current market prices, rates, indices
+- `financial_ratios`: Standard ratio computations
+- `dcf_valuation`: Discounted cash flow models
+- `risk_metrics`: VaR, Sharpe, beta calculations
+- `portfolio_optimizer`: Mean-variance optimization
+
+## Output Format
+- Lead with the direct answer
+- Show all calculations explicitly
+- Use financial notation (%, $, x for multiples)
+- Flag assumptions clearly
+- Provide context (industry benchmarks, historical norms)
+
+Be precise, quantitative, and professional. Show your math."""
 
 
-def _get_llm_client():
-    """Return configured LLM client based on provider setting."""
-    if LLM_PROVIDER == "groq" and GROQ_API_KEY:
-        from groq import Groq
-        return "groq", Groq(api_key=GROQ_API_KEY), GROQ_MODEL
-    else:
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
-        return "openai", client, OPENAI_MODEL
+class FinanceAgent:
+    """
+    A2A-compliant Finance Purple Agent.
+    Uses OpenAI GPT-4o with function calling for structured financial reasoning.
+    """
 
-
-class Agent:
     def __init__(self):
-        self.messenger = Messenger()
-        self.provider, self.client, self.model = _get_llm_client()
+        self.client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        self.model = os.environ.get("OPENAI_MODEL", "gpt-4o")
+        self.conversation_history: list[dict] = []
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
-        """Run the Finance Agent with CoT reasoning and tool use.
-
-        Args:
-            message: Incoming A2A message with financial task
-            updater: Report progress and results back to AgentBeats
-        """
+        """Main entry point — process a financial query with CoT + tool use."""
         input_text = get_message_text(message)
 
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Analyzing financial task...")
+            new_agent_text_message("🔍 Analyzing your financial query..."),
         )
 
+        # Add user message to conversation history
+        self.conversation_history.append({"role": "user", "content": input_text})
+
+        # Run the agentic loop with tool use
+        response_text = await self._run_agent_loop(updater)
+
+        # Add assistant response to history
+        self.conversation_history.append({"role": "assistant", "content": response_text})
+
+        # Emit final artifact
+        await updater.add_artifact(
+            parts=[Part(root=TextPart(text=response_text))],
+            name="financial_analysis",
+        )
+
+    async def _run_agent_loop(self, updater: TaskUpdater) -> str:
+        """
+        Agentic loop: LLM → tool calls → LLM → ... → final answer.
+        Max 8 iterations to prevent runaway loops.
+        """
         messages = [
-            {"role": "system", "content": FINANCE_SYSTEM_PROMPT},
-            {"role": "user", "content": input_text},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *self.conversation_history,
         ]
 
-        # Agentic loop: run until no more tool calls
-        max_iterations = 5
-        for iteration in range(max_iterations):
-            await updater.update_status(
-                TaskState.working,
-                new_agent_text_message(f"Reasoning step {iteration + 1}...")
+        for iteration in range(8):
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=FINANCE_TOOLS,
+                tool_choice="auto",
+                temperature=0.1,  # Low temp for precise financial calculations
+                max_tokens=4096,
             )
 
-            response = self._call_llm(messages)
-            response_message = response.choices[0].message
+            choice = response.choices[0]
+            msg = choice.message
 
-            # Check for tool calls
-            if hasattr(response_message, "tool_calls") and response_message.tool_calls:
-                # Append assistant message with tool calls
-                messages.append({
-                    "role": "assistant",
-                    "content": response_message.content or "",
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                        }
-                        for tc in response_message.tool_calls
-                    ],
+            # No tool calls — we have our final answer
+            if not msg.tool_calls:
+                return msg.content or "Analysis complete."
+
+            # Process tool calls
+            messages.append(msg.model_dump(exclude_unset=True))
+
+            tool_results = []
+            for tool_call in msg.tool_calls:
+                fn_name = tool_call.function.name
+                try:
+                    fn_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                await updater.update_status(
+                    TaskState.working,
+                    new_agent_text_message(f"⚙️ Running {fn_name}..."),
+                )
+
+                result = await execute_tool(fn_name, fn_args)
+                tool_results.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "content": json.dumps(result),
                 })
 
-                # Execute each tool call
-                for tool_call in response_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    try:
-                        tool_args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        tool_args = {}
+            messages.extend(tool_results)
 
-                    await updater.update_status(
-                        TaskState.working,
-                        new_agent_text_message(f"Using tool: {tool_name}")
-                    )
-
-                    tool_result = dispatch_tool(tool_name, tool_args)
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": tool_result,
-                    })
-            else:
-                # No tool calls — final answer reached
-                final_answer = response_message.content or "No response generated."
-
-                # Try to parse as JSON for structured output
-                try:
-                    parsed = json.loads(final_answer)
-                    output_text = json.dumps(parsed, indent=2)
-                except (json.JSONDecodeError, TypeError):
-                    output_text = final_answer
-
-                await updater.add_artifact(
-                    parts=[Part(root=TextPart(text=output_text))],
-                    name="FinanceAnalysis",
-                )
-                return
-
-        # Max iterations reached — return last response
-        last_content = messages[-1].get("content", "Analysis incomplete after max iterations.")
-        await updater.add_artifact(
-            parts=[Part(root=TextPart(text=str(last_content)))],
-            name="FinanceAnalysis",
+        # Fallback: ask for final synthesis without tools
+        messages.append({
+            "role": "user",
+            "content": "Please provide your final analysis based on the information gathered.",
+        })
+        final = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=4096,
         )
-
-    def _call_llm(self, messages: list) -> object:
-        """Call LLM with tool support."""
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-            "tools": TOOLS_SCHEMA,
-            "tool_choice": "auto",
-            "temperature": 0.1,  # Low temp for financial precision
-        }
-        if self.provider == "groq":
-            return self.client.chat.completions.create(**kwargs)
-        else:
-            return self.client.chat.completions.create(**kwargs)
+        return final.choices[0].message.content or "Analysis complete."
